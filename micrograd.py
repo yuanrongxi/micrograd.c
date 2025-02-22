@@ -1,4 +1,13 @@
+"""
+Defines a simple autograd engine and uses it to classify points in the plane
+to 3 classes (red, green, blue) using a simple multilayer perceptron (MLP).
+"""
 import math
+import time
+
+from utils import RNG, gen_data_yinyang, draw_dot, vis_color
+random = RNG(42)
+
 # -----------------------------------------------------------------------------
 # Value. Similar to PyTorch's Tensor but only of size 1 element
 
@@ -123,3 +132,167 @@ class Value:
 
     def __repr__(self):
         return f"Value(data={self.data}, grad={self.grad})"
+
+# -----------------------------------------------------------------------------
+# Multi-Layer Perceptron (MLP) network. Module here is similar to PyTorch's nn.Module
+
+class Module:
+
+    def zero_grad(self):
+        for p in self.parameters():
+            p.grad = 0
+
+    def parameters(self):
+        return []
+
+class Neuron(Module):
+
+    def __init__(self, nin, nonlin=True):
+        self.w = [Value(random.uniform(-1, 1) * nin**-0.5) for _ in range(nin)]
+        self.b = Value(0)
+        self.nonlin = nonlin
+        # color the neuron params light green (only used in graphviz visualization)
+        vis_color([self.b] + self.w, "lightgreen")
+
+    def __call__(self, x):
+        act = sum((wi*xi for wi,xi in zip(self.w, x)), self.b)
+        return act.tanh() if self.nonlin else act
+
+    def parameters(self):
+        return self.w + [self.b]
+
+    def __repr__(self):
+        return f"{'TanH' if self.nonlin else 'Linear'}Neuron({len(self.w)})"
+
+class Layer(Module):
+
+    def __init__(self, nin, nout, **kwargs):
+        self.neurons = [Neuron(nin, **kwargs) for _ in range(nout)]
+
+    def __call__(self, x):
+        out = [n(x) for n in self.neurons]
+        return out
+
+    def parameters(self):
+        return [p for n in self.neurons for p in n.parameters()]
+
+    def __repr__(self):
+        return f"Layer of [{', '.join(str(n) for n in self.neurons)}]"
+
+class MLP(Module):
+
+    def __init__(self, nin, nouts):
+        sz = [nin] + nouts
+        self.layers = [Layer(sz[i], sz[i+1], nonlin=i!=len(nouts)-1) for i in range(len(nouts))]
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def parameters(self):
+        return [p for layer in self.layers for p in layer.parameters()]
+
+    def __repr__(self):
+        return f"MLP of [{', '.join(str(layer) for layer in self.layers)}]"
+
+# -----------------------------------------------------------------------------
+# loss function: the negative log likelihood (NLL) loss
+# NLL loss = CrossEntropy loss when the targets are one-hot vectors
+# same as PyTorch's F.cross_entropy
+
+def cross_entropy(logits, target):
+    # subtract the max for numerical stability (avoids overflow)
+    # commenting these two lines out to get a cleaner visualization
+    # max_val = max(val.data for val in logits)
+    # logits = [val - max_val for val in logits]
+    # 1) evaluate elementwise e^x
+    ex = [x.exp() for x in logits]
+    # 2) compute the sum of the above
+    denom = sum(ex)
+    # 3) normalize by the sum to get probabilities
+    probs = [x / denom for x in ex]
+    # 4) log the probabilities at target
+    logp = (probs[target]).log()
+    # 5) the negative log likelihood loss (invert so we get a loss - lower is better)
+    nll = -logp
+    return nll
+
+# -----------------------------------------------------------------------------
+# The AdamW optimizer, same as PyTorch optim.AdamW
+
+class AdamW:
+    def __init__(self, parameters, lr=1e-1, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0):
+        self.parameters = parameters
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        # state of the optimizer
+        self.t = 0 # step counter
+        for p in self.parameters:
+            p.m = 0 # first moment
+            p.v = 0 # second moment
+
+    def step(self):
+        self.t += 1
+        for p in self.parameters:
+            if p.grad is None:
+                continue
+            p.m = self.beta1 * p.m + (1 - self.beta1) * p.grad
+            p.v = self.beta2 * p.v + (1 - self.beta2) * (p.grad ** 2)
+            m_hat = p.m / (1 - self.beta1 ** self.t)
+            v_hat = p.v / (1 - self.beta2 ** self.t)
+            p.data -= self.lr * (m_hat / (v_hat ** 0.5 + 1e-8) + self.weight_decay * p.data)
+
+    def zero_grad(self):
+        for p in self.parameters:
+            p.grad = 0
+
+# -----------------------------------------------------------------------------
+# let's train!
+
+# generate a dataset with 100 2-dimensional datapoints in 3 classes
+train_split, val_split, test_split = gen_data_yinyang(random, n=1000)
+
+# init the model: 2D inputs, 8 neurons, 3 outputs (logits)
+model = MLP(2, [8, 3])
+
+# optimize using AdamW
+optimizer = AdamW(model.parameters(), lr=1e-1, weight_decay=1e-4)
+
+def loss_fun(model, split):
+    # evaluate the loss function on a given data split
+    total_loss = Value(0.0)
+    for x, y in split:
+        logits = model(x)
+        loss = cross_entropy(logits, y)
+        total_loss = total_loss + loss
+    mean_loss = total_loss * (1.0 / len(split))
+    return mean_loss
+
+# train the network
+num_steps = 100
+start_time = time.time()
+for step in range(num_steps):
+
+    # evaluate the validation split every few steps
+    if step % 10 == 0:
+        val_loss = loss_fun(model, val_split)
+        print(f"step {step+1}/{num_steps}, val loss {val_loss.data:.6f}")
+
+    # forward the network and the loss and all training datapoints
+    loss = loss_fun(model, train_split)
+    # backward pass (calculate the gradient of the loss w.r.t. the model parameters)
+    loss.backward()
+    # update model parameters
+    optimizer.step()
+    optimizer.zero_grad()
+    # print some stats
+    print(f"step {step+1}/{num_steps}, train loss {loss.data}")
+
+val_loss = loss_fun(model, test_split)
+print(f"test loss {val_loss.data:.6f}")
+
+end_time = time.time()
+print(f"Python time taken(steps:{num_steps}, samples:{1000}): {end_time - start_time:.4f} seconds")
